@@ -123,7 +123,6 @@ delete[] centroids;
 }
 
 void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
-    bool end = false;
     int iter = 0;
     int * count = new int[k];
 
@@ -136,8 +135,13 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
     // cont = new bool;
     bool cont;
     double *prev_cx, *prev_cy;
-    prev_cx = (double*)malloc(k*sizeof(double));
-    prev_cy = (double*)malloc(k*sizeof(double));
+    #ifdef PINMEM
+        cudaMallocHost(&prev_cx, k*sizeof(double));
+        cudaMallocHost(&prev_cy, k*sizeof(double));
+    #else
+        prev_cx = (double*)malloc(k*sizeof(double));
+        prev_cy = (double*)malloc(k*sizeof(double));
+    #endif
 
     cudaMalloc(&d_x, n * sizeof(int));
     cudaMalloc(&d_y, n * sizeof(int));
@@ -174,7 +178,7 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
         // cudaDeviceSynchronize();
         
         updateKernel<<<gridSize, blockSize>>>(d_x, d_y, d_c, k, n, d_sumx, d_sumy, /* d_changed, d_cont,*/ d_count);
-        cudaDeviceSynchronize(); // wait for gpu
+        // cudaDeviceSynchronize(); // wait for gpu
         // cudaMemcpy(cont, d_cont, 1 * sizeof(bool), cudaMemcpyDeviceToHost);
         
         computeCentroids<<<(k + blockSize - 1) / blockSize, blockSize>>>(k, d_sumx, d_sumy, d_count, d_cx, d_cy);
@@ -182,7 +186,9 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
 
         cudaMemcpy(cx, d_cx, k * sizeof(double), cudaMemcpyDeviceToHost);
         cudaMemcpy(cy, d_cy, k * sizeof(double), cudaMemcpyDeviceToHost);
-        // cudaDeviceSynchronize(); // there is one sync in main already
+        cudaDeviceSynchronize(); // there is one sync in main already
+
+        // easiest way to do this is in here
         #pragma omp parallel for reduction(|:cont)
         for(int i = 0; i < k; i++){
             cont |= ((cx[i] != prev_cx[i]) || (cy[i] != prev_cy[i]));
@@ -203,7 +209,10 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
             }
         #endif
         if (cont == false){ 
+            cudaMemcpy(count, d_count, k * sizeof(int), cudaMemcpyDeviceToHost);
+            cudaMemcpy(c, d_c, n * sizeof(int), cudaMemcpyDeviceToHost);
             printf("iter %d, cont=%d\n", iter, cont);
+            
             break; 
         } // means no changes -- converged
 
@@ -218,6 +227,10 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
     cudaFree(d_sumx);
     cudaFree(d_sumy);
     cudaFree(d_count);
+    #ifdef PINMEM
+        cudaFreeHost(prev_cx);
+        cudaFreeHost(prev_cy);
+    #endif
     // cudaFree(d_changed);
     // cudaFree(d_cont);
 }
@@ -286,7 +299,7 @@ int main(int argc, char *argv[]) {
     double kmeans_start = omp_get_wtime();
     kmeans(x, y, c, cx, cy, k, n);
 
-    cudaDeviceSynchronize();
+    // cudaDeviceSynchronize(); // sync inside kmeans func
 
     double kmeans_end = omp_get_wtime();
     printf("K-Means Execution Time: %f seconds\n", kmeans_end - kmeans_start);
