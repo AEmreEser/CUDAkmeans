@@ -15,6 +15,10 @@ using namespace std;
 #define MAX_ITER 500
 #endif
 
+#ifndef BLOCKSIZE
+#define BLOCKSIZE 256
+#endif
+
 #define CHECK_CUDA_ERROR() { \
     cudaError_t err = cudaGetLastError(); \
     if (err != cudaSuccess) { \
@@ -24,9 +28,11 @@ using namespace std;
 }
 
 /** TODO:
---1 do the convergence check thing
+--1 do the convergence check thing 
+-.5 use Harris reduction on convergence check
 --2 try to use shared memory as much as you can
---3 Stanford bithacks
+--3 -- BADPERF: Stanford bithacks
+--4 Cuda Event elapsed time kullan!!
 **/
 
 // #define DEBUG
@@ -48,8 +54,9 @@ __global__ void assignKernel(int *x, int *y, int *c, double *cx, double *cy, /* 
                 minDist = distance;
                 cluster = j;
             }
-            // minDist = distance * static_cast<int>(distance < minDist) + minDist * static_cast<int>(!(distance < minDist));
-            // cluster = j * static_cast<int>(distance < minDist) + cluster * static_cast<int>(!(distance < minDist));
+            // these take more time than the if check above - probably because of the conversion and the multiplication
+            // cluster = (j * (distance < minDist)) + (cluster * (!(distance < minDist)));
+            // minDist = distance * (distance < minDist) + minDist * (!(distance < minDist));
         }
 
         // changed[idx] = (c[idx] != cluster);
@@ -88,6 +95,9 @@ __global__ void computeCentroids(int k, double *sumx, double *sumy, int *count, 
             cx[idx] = sumx[idx] / count[idx];
             cy[idx] = sumy[idx] / count[idx];
         }
+        // for some reason these affect performance badly, probably due to the multiplications
+        // cx[idx] = (sumx[idx] / count[idx]) * (count[idx] > 0) + cx[idx] * (count[idx] <= 0);
+        // cy[idx] = (sumy[idx] / count[idx]) * (count[idx] > 0) + cy[idx] * (count[idx] <= 0);
     }
 }
 
@@ -160,9 +170,9 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
     cudaMemcpy(d_cy, cy, k * sizeof(double), cudaMemcpyHostToDevice);
     printf("begin\n");
 
-    int blockSize = 256;
+    int blockSize = BLOCKSIZE;
     int gridSize = (n + blockSize - 1) / blockSize;
-    // cudaMemset(d_c, -1, n * sizeof(int)); // set to some invalid cluster so that every pt gets a cluster change in the first iter
+    cudaMemset(d_c, -1, n * sizeof(int)); // set to some invalid cluster so that every pt gets a cluster change in the first iter
 
     while (iter < MAX_ITER) {
         #ifdef DEBUG
@@ -182,7 +192,7 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
         // cudaMemcpy(cont, d_cont, 1 * sizeof(bool), cudaMemcpyDeviceToHost);
         
         computeCentroids<<<(k + blockSize - 1) / blockSize, blockSize>>>(k, d_sumx, d_sumy, d_count, d_cx, d_cy);
-        // cudaDeviceSynchronize();
+        cudaDeviceSynchronize(); // necessary
 
         cudaMemcpy(cx, d_cx, k * sizeof(double), cudaMemcpyDeviceToHost);
         cudaMemcpy(cy, d_cy, k * sizeof(double), cudaMemcpyDeviceToHost);
@@ -311,6 +321,7 @@ int main(int argc, char *argv[]) {
     #endif
 
     double totalSSD = 0.0;
+    #pragma omp parallel for reduction(+:totalSSD)
     for (int i = 0; i < n; i++) {
         int cluster = c[i];
         totalSSD += dist(x[i], y[i], cx[cluster], cy[cluster]);
