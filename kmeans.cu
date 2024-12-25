@@ -235,22 +235,14 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
         bool *d_changed;
         bool *d_red_change;
         cudaMalloc(&d_red_change, 1 * sizeof(bool));
-        CHECK_CUDA_ERROR();
         cudaMalloc(&d_prev_cx, k * sizeof(double));
-        CHECK_CUDA_ERROR();
         cudaMalloc(&d_prev_cy, k * sizeof(double));
-        CHECK_CUDA_ERROR();
         cudaMalloc(&d_changed, k * sizeof(bool));
-        CHECK_CUDA_ERROR();
 
         // cudaMemset(d_prev_cx, -1.0f, k*sizeof(double));
-        CHECK_CUDA_ERROR();
         // cudaMemset(d_prev_cy, -1.0f, k*sizeof(double));
-        CHECK_CUDA_ERROR();
         cudaMemset(d_changed, false, k*sizeof(bool));
-        CHECK_CUDA_ERROR();
         cudaMemset(d_red_change,    false, 1*sizeof(bool));
-        CHECK_CUDA_ERROR();
     #endif
 
     cudaMalloc(&d_x, n * sizeof(int));
