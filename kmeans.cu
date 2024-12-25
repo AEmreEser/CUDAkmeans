@@ -214,17 +214,15 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
     double acc_red_time = 0.0f, acc_data_transfer_time = 0.0f;
 
     int *d_x, *d_y, *d_c;
-    double *d_cx, *d_cy, *d_sumx, *d_sumy, *d_prev_cx, *d_prev_cy;
+    double *d_cx, *d_cy, *d_sumx, *d_sumy; 
     // double *d_all_dists;
     // int *d_all_assignments;
     int *d_count;
-    bool *d_changed;
-    bool *d_red_change;
     // bool *cont;
     // cont = new bool;
     bool cont;
-    double *prev_cx, *prev_cy;
     #ifdef HOSTREDUCE
+        double *prev_cx, *prev_cy;
         #ifdef PINMEM
             cudaMallocHost(&prev_cx, k*sizeof(double));
             cudaMallocHost(&prev_cy, k*sizeof(double));
@@ -233,6 +231,9 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
             prev_cy = (double*)malloc(k*sizeof(double));
         #endif
     #else
+        double *d_prev_cx, *d_prev_cy;
+        bool *d_changed;
+        bool *d_red_change;
         cudaMalloc(&d_red_change, 1 * sizeof(bool));
         CHECK_CUDA_ERROR();
         cudaMalloc(&d_prev_cx, k * sizeof(double));
@@ -372,7 +373,12 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
         iter++;
     }
 
-    printf("Acc Host Reduction: %f\n", acc_red_time);
+    #ifdef HOSTREDUCE
+        printf("HOST Acc Reduction: %f\n", acc_red_time);
+    #else
+        printf("Acc Reduction: %f\n", acc_red_time);
+    #endif
+
     printf("Acc Data Transfer: %f\n", acc_data_transfer_time);
 
     cudaFree(d_x);
@@ -436,7 +442,10 @@ int readfile(const string& fname, int*& x, int*& y) {
 int main(int argc, char *argv[]) {
     // Check arguments
     if (argc - 1 != 2) {
-        printf("./test <filename> <k>\n");
+        printf("./kmeans <filename> <k>\n");
+        exit(-1);
+    } else if (atoi(argv[2]) < 1){
+        printf("k must be a positive integer number\n");
         exit(-1);
     }
 
