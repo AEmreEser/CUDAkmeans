@@ -15,10 +15,6 @@ using namespace std;
 #define MAX_ITER 500
 #endif
 
-#ifndef BLOCKSIZE
-#define BLOCKSIZE 256
-#endif
-
 #define CHECK_CUDA_ERROR() { \
     cudaError_t err = cudaGetLastError(); \
     if (err != cudaSuccess) { \
@@ -28,11 +24,11 @@ using namespace std;
 }
 
 /** TODO:
---1 do the convergence check thing 
+done: --1 do the convergence check thing 
+failed: --2 use n*k threads and parallelize the for loop in assignKernel -- for large k values this is the bottleneck currently
+--3 Join the kernels into one big kernel and do everything on the gpu, don't lose time communicating
+--4 Use the cuda timer stuff for measuring walltimes - not the omp walltime thing
 -.5 use Harris reduction on convergence check
---2 try to use shared memory as much as you can
---3 -- BADPERF: Stanford bithacks
---4 Cuda Event elapsed time kullan!!
 **/
 
 // #define DEBUG
@@ -43,11 +39,10 @@ __host__ __device__ double dist(double x1, double y1, double x2, double y2) {
 
 __global__ void assignKernel(int *x, int *y, int *c, double *cx, double *cy, /* bool *changed, */ int k, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    // printf("%d\n", idx);
     if (idx < n) {
         int cluster;
-        double minDist = static_cast<double>(INT_MAX);
-        // Assign to closest center
+        double minDist = (INT_MAX); // static_cast<double>(INT_MAX); // not using casting saves a miniscule amount of time
+        // for really large values of k, the for loop creates a huge bottleneck
         for (int j = 0; j < k; j++) {
             double distance = dist(cx[j], cy[j], x[idx], y[idx]);
             if (distance < minDist) {
@@ -66,6 +61,46 @@ __global__ void assignKernel(int *x, int *y, int *c, double *cx, double *cy, /* 
 
     }
 }
+
+// __global__ void assignKernelFullyParallel(int *x, int *y, int *c, double *cx, double *cy, double* all_dists, int* all_assignments, int k, int n) {
+//     int idx = blockDim.x * blockIdx.x + threadIdx.x;
+//     int maxthreads = n*k;
+//     if(idx >= maxthreads){ return; }
+
+//     int kidx = threadIdx.x; int nidx = blockIdx.x;
+
+//     // extern __shared__ double dists_to_centroids[]; // size == k*sizeof(double) + k*sizeof(long long int)
+
+//     // dists_to_centroids[kidx] = dist(x[nidx], y[nidx], cx[kidx], cy[kidx]); 
+//     // dists_to_centroids[k + kidx] = kidx;
+//     all_dists[idx] = dist(x[nidx], y[nidx], cx[kidx], cy[kidx]); 
+//     all_assignments[idx] = -1;
+
+//     __syncthreads();
+
+//     for(long long int s=1; s < k; s*=2){ // assume k is divisible by 2
+//         if(kidx % (2*s) == 0){
+//             // if(dists_to_centroids[kidx] > dists_to_centroids[kidx + s]){
+//             //     dists_to_centroids[kidx] = dists_to_centroids[kidx + s]; // min reduction
+//             //     dists_to_centroids[k + kidx] = __longlong_as_double(s);  // total goddamn waste
+//             // } // if
+//             printf("idx=%d, all_dists[idx]=%f, all_dists[idx+s]=%f\n", idx ,all_dists[idx], all_dists[idx+s]);
+//             if (all_dists[idx] > all_dists[idx+s]){
+//                 all_dists[idx] = all_dists[idx+s];
+//                 all_assignments[idx] = static_cast<int>(s);
+//             }
+//             printf("nidx=%d, kidx=%d, dists=%f, kidx+s=%d, dists=%f\n", nidx, kidx, all_dists[kidx], kidx+s, all_dists[kidx+s]);
+//         } // if %
+//         __syncthreads();
+//     } // for
+
+//     if (kidx == 0){
+//         c[nidx] = (all_assignments[idx]);
+//         printf("nidx=%d, c[nidx]=%d\n", nidx, c[nidx]);
+//     }
+
+// }
+
 
 __global__ void updateKernel(int *x, int *y, int *c, int k, int n, double *sumx, double *sumy, /* bool* changed, bool* cont, */ int *count) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -135,9 +170,12 @@ delete[] centroids;
 void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
     int iter = 0;
     int * count = new int[k];
+    double acc_red_time = 0.0f, acc_data_transfer_time = 0.0f;
 
     int *d_x, *d_y, *d_c;
     double *d_cx, *d_cy, *d_sumx, *d_sumy;
+    // double *d_all_dists;
+    // int *d_all_assignments;
     int *d_count;
     // bool *d_changed;
     // bool *d_cont;
@@ -161,6 +199,8 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
     cudaMalloc(&d_sumx, k * sizeof(double));
     cudaMalloc(&d_sumy, k * sizeof(double));
     cudaMalloc(&d_count, k * sizeof(int));
+    // cudaMalloc(&d_all_dists, n*k* sizeof(double));
+    // cudaMalloc(&d_all_assignments, n*k* sizeof(int));
     // cudaMalloc(&d_changed, n * sizeof(bool));
     // cudaMalloc(&d_cont, 1 * sizeof(bool));
     
@@ -170,13 +210,15 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
     cudaMemcpy(d_cy, cy, k * sizeof(double), cudaMemcpyHostToDevice);
     printf("begin\n");
 
-    int blockSize = BLOCKSIZE;
+    int blockSize = 256;
     int gridSize = (n + blockSize - 1) / blockSize;
     cudaMemset(d_c, -1, n * sizeof(int)); // set to some invalid cluster so that every pt gets a cluster change in the first iter
+    // cudaMemset(d_all_dists, -1.0f, n*k* sizeof(double)); // set to some invalid cluster so that every pt gets a cluster change in the first iter
+    // cudaMemset(d_all_assignments, -1, n*k* sizeof(int)); // set to some invalid cluster so that every pt gets a cluster change in the first iter
 
     while (iter < MAX_ITER) {
         #ifdef DEBUG
-            printf("iter %d\n", iter);
+            printf("==========%d=========\n", iter);
         #endif
         cont = false;
         
@@ -184,21 +226,37 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
         cudaMemset(d_sumy, 0, k * sizeof(double));
         cudaMemset(d_count, 0, k * sizeof(int));
 
+        double timer_begin = omp_get_wtime();
         assignKernel<<<gridSize, blockSize>>>(d_x, d_y, d_c, d_cx, d_cy, /*d_changed,*/ k, n);
-        // cudaDeviceSynchronize();
+        // assignKernelFullyParallel<<< (n*k + k - 1)/k, k >>>(d_x, d_y, d_c, d_cx, d_cy, d_all_dists, d_all_assignments, /*d_changed,*/ k, n);
+        cudaDeviceSynchronize();
+        double timer_end = omp_get_wtime();
+        // printf("Assign Kernel: %f\n", timer_end - timer_begin);
         
+        timer_begin = omp_get_wtime();
         updateKernel<<<gridSize, blockSize>>>(d_x, d_y, d_c, k, n, d_sumx, d_sumy, /* d_changed, d_cont,*/ d_count);
-        // cudaDeviceSynchronize(); // wait for gpu
+        cudaDeviceSynchronize(); // wait for gpu
+        timer_end = omp_get_wtime();
+        // printf("Update Kernel: %f\n", timer_end - timer_begin);
         // cudaMemcpy(cont, d_cont, 1 * sizeof(bool), cudaMemcpyDeviceToHost);
         
+        timer_begin = omp_get_wtime();
         computeCentroids<<<(k + blockSize - 1) / blockSize, blockSize>>>(k, d_sumx, d_sumy, d_count, d_cx, d_cy);
-        cudaDeviceSynchronize(); // necessary
+        timer_end = omp_get_wtime();
+        // printf("Centroid Kernel: %f\n", timer_end - timer_begin);
+        // cudaDeviceSynchronize();
 
+
+        timer_begin = omp_get_wtime();
         cudaMemcpy(cx, d_cx, k * sizeof(double), cudaMemcpyDeviceToHost);
         cudaMemcpy(cy, d_cy, k * sizeof(double), cudaMemcpyDeviceToHost);
         cudaDeviceSynchronize(); // there is one sync in main already
+        timer_end = omp_get_wtime();
+        // printf("Data migration (device to host): %f\n", timer_end - timer_begin);
+        acc_data_transfer_time += timer_end - timer_begin;
 
         // easiest way to do this is in here
+        timer_begin = omp_get_wtime();
         #pragma omp parallel for reduction(|:cont)
         for(int i = 0; i < k; i++){
             cont |= ((cx[i] != prev_cx[i]) || (cy[i] != prev_cy[i]));
@@ -209,6 +267,9 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
             prev_cx[i] = cx[i];
             prev_cy[i] = cy[i];
         }
+        timer_end = omp_get_wtime();
+        // printf("Host Reduction: %f\n", timer_end - timer_begin);
+        acc_red_time += timer_end - timer_begin;
 
         #ifdef DEBUG
             cudaMemcpy(count, d_count, k * sizeof(int), cudaMemcpyDeviceToHost);
@@ -228,6 +289,9 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
 
         iter++;
     }
+
+    printf("Acc Host Reduction: %f\n", acc_red_time);
+    printf("Acc Data Transfer: %f\n", acc_data_transfer_time);
 
     cudaFree(d_x);
     cudaFree(d_y);
@@ -321,7 +385,6 @@ int main(int argc, char *argv[]) {
     #endif
 
     double totalSSD = 0.0;
-    #pragma omp parallel for reduction(+:totalSSD)
     for (int i = 0; i < n; i++) {
         int cluster = c[i];
         totalSSD += dist(x[i], y[i], cx[cluster], cy[cluster]);
