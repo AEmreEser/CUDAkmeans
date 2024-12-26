@@ -29,6 +29,8 @@ failed: --2 use n*k threads and parallelize the for loop in assignKernel -- for 
 --3 Join the kernels into one big kernel and do everything on the gpu, don't lose time communicating
 --4 Use the cuda timer stuff for measuring walltimes - not the omp walltime thing
 done:-.5 use Harris reduction on convergence check
+--6 comment cleanup
+--7 two gpus
 **/
 
 // #define DEBUG
@@ -123,8 +125,10 @@ __global__ void check_cluster_change(double *cx, double *cy, double *prev_cx, do
 
     // Perform parallel reduction in shared memory using OR operation
     // FOR NOW ASSUME THAT K IS AN INTEGER MULTIPLE OF 2
-    for (int s = 1; s < k; s *= 2) {
-        if (threadId % (2 * s) == 0) {
+    for (int s = 1; s < k; s *= 2) { 
+        int index = 2 * s * threadId;
+        // if (threadId % (2 * s) == 0) { // highly divergent
+        if(index < k){ // not divergent 
             changed[threadId] |= changed[threadId + s];
         }
         __syncthreads();
