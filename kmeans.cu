@@ -15,6 +15,10 @@ using namespace std;
 #define MAX_ITER 500
 #endif
 
+#ifndef OUTFILE
+#define OUTFILE "out.txt"
+#endif
+
 #define CHECK_CUDA_ERROR() { \
     cudaError_t err = cudaGetLastError(); \
     if (err != cudaSuccess) { \
@@ -212,6 +216,19 @@ void randomCenters(int *x, int *y, int n, int k, double *cx, double *cy) {
 delete[] centroids;
 }
 
+void writeClusterAssignments(const int* x, const int* y, const int* c, int n, const string& filename) {
+    ofstream outFile(filename);
+    if (!outFile) {
+        throw runtime_error("Could not open file: " + filename);
+    }
+    
+    for (int i = 0; i < n; i++) {
+        outFile << x[i] << " " << y[i] << " " << c[i] << "\n";
+    }
+    
+    outFile.close();
+}
+
 void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
     int iter = 0;
     int * count = new int[k];
@@ -359,9 +376,9 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
                 cudaMemcpy(cx, d_cx, k * sizeof(double), cudaMemcpyDeviceToHost);
                 cudaMemcpy(cy, d_cy, k * sizeof(double), cudaMemcpyDeviceToHost);
             #endif
-            cudaMemcpy(count, d_count, k * sizeof(int), cudaMemcpyDeviceToHost);
             cudaMemcpy(c, d_c, n * sizeof(int), cudaMemcpyDeviceToHost);
             printf("Converged at iteration %d\n", iter);
+            writeClusterAssignments(x, y, c, n, OUTFILE);
             
             break; 
         } // means no changes -- converged
@@ -371,11 +388,11 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
 
     #ifdef HOSTREDUCE
         printf("HOST Acc Reduction: %f\n", acc_red_time);
+        printf("Acc Data Transfer: %f\n", acc_data_transfer_time);
     #else
         printf("Acc Reduction: %f\n", acc_red_time);
     #endif
 
-    printf("Acc Data Transfer: %f\n", acc_data_transfer_time);
 
     cudaFree(d_x);
     cudaFree(d_y);
