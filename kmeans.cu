@@ -168,7 +168,7 @@ __global__ void assignKernel(int *x, int *y, int *c, double *cx, double *cy, /* 
 }
 
 // single block, k many threads
-__global__ void check_cluster_change(double *cx, double *cy, double *prev_cx, double *prev_cy, bool* changed, bool *red_change, int k) {
+__global__ void checkClusterChange(double *cx, double *cy, double *prev_cx, double *prev_cy, bool* changed, bool *red_change, int k) {
     int threadId = threadIdx.x + blockIdx.x * blockDim.x;
     if (threadId > k){ return; }
 
@@ -415,7 +415,7 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
             acc_red_time += timer_end - timer_begin;
         #else
             cudaEventRecord(start, 0);
-            check_cluster_change<<<k, 1>>>(d_cx, d_cy, d_prev_cx, d_prev_cy, d_changed, d_red_change, k);
+            checkClusterChange<<<k, 1>>>(d_cx, d_cy, d_prev_cx, d_prev_cy, d_changed, d_red_change, k);
             cudaDeviceSynchronize();
             cudaMemcpy(&cont, d_red_change, 1 *sizeof(bool), cudaMemcpyDeviceToHost);
             cudaEventRecord(stop, 0);
