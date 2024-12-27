@@ -11,6 +11,15 @@
 
 using namespace std;
 
+/** 
+    IMPORTANT:
+        *RECOMMENDEDCONFIG: 
+            FLAT = not defined, HOSTREDUCE = not defined
+        *EXPLANATIONS:
+            both FLAT and HOSTREDUCE result in significant performance penalties -- they will both be turned off by default
+            FLAT produces wrong results for k > 1024 --> the program will automatically use regular assign kernel instead of FLAT if FLAT is specified for k > 1024
+ */
+
 #ifndef MAX_ITER
 #define MAX_ITER 500
 #endif
@@ -34,11 +43,109 @@ canceled: --3 Join the kernels into one big kernel and do everything on the gpu,
 done:--4 Use the cuda timer stuff for measuring walltimes - not the omp walltime thing
 done:-.5 use Harris reduction on convergence check
 done:--6 comment cleanup
---7 two gpus
+done:--7 two gpus
 **/
 
 __host__ __device__ double dist(double x1, double y1, double x2, double y2) {
     return (x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2);  // sqrt is omitted as it reduces performance.
+}
+
+// Helper function for atomic minimum operation on doubles
+__device__ void atomicMin_double(double* address, double val) {
+    unsigned long long* address_as_ull = (unsigned long long*)address;
+    unsigned long long old = *address_as_ull;
+    unsigned long long assumed;
+    
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+                        __double_as_longlong(min(val, __longlong_as_double(assumed))));
+    } while (assumed != old);
+}
+
+__global__ void assignKernel_flat_old(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int point_idx = idx / k;  // Which point this thread is working on
+    int cluster_idx = idx % k;  // Which cluster this thread is evaluating
+    
+    if (point_idx < n) {
+        // Each thread computes distance for its point-cluster pair
+        double distance = dist(cx[cluster_idx], cy[cluster_idx], x[point_idx], y[point_idx]);
+        
+        // Shared memory to store distances and corresponding clusters
+        extern __shared__ double shared_data[];
+        double* shared_distances = shared_data;
+        int* shared_clusters = (int*)&shared_data[blockDim.x];
+        
+        // Store this thread's results in shared memory
+        shared_distances[threadIdx.x] = distance;
+        shared_clusters[threadIdx.x] = cluster_idx;
+        __syncthreads();
+        
+        // First thread for each point finds the minimum among all clusters
+        if (cluster_idx == 0) {
+            double min_dist = distance;
+            int best_cluster = cluster_idx;
+            
+            // Find minimum distance among all clusters for this point
+            int point_start = (threadIdx.x / k) * k;  // Start index for this point's clusters
+            for (int j = 1; j < k; j++) {
+                int idx_in_block = point_start + j;
+                if (idx_in_block < blockDim.x) {
+                    if (shared_distances[idx_in_block] < min_dist) {
+                        min_dist = shared_distances[idx_in_block];
+                        best_cluster = shared_clusters[idx_in_block];
+                    }
+                }
+            }
+            
+            // Write final result for this point
+            c[point_idx] = best_cluster;
+        }
+    }
+}
+
+__global__ void assignKernel_flat(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int point_idx = idx / k;  // Which point this thread is working on
+    int cluster_idx = idx % k;  // Which cluster this thread is evaluating
+    
+    if (point_idx < n) {
+        // Calculate distance for this point-cluster pair
+        double distance = dist(cx[cluster_idx], cy[cluster_idx], x[point_idx], y[point_idx]);
+        
+        // Use shared memory to track minimum distance for each point within a block
+        __shared__ struct {
+            double dist;
+            int cluster;
+        } shared_min[256];  // Assume block size <= 256
+        
+        // Thread's position within its point group in the block
+        int local_idx = threadIdx.x % k;
+        int point_group_idx = threadIdx.x / k;
+        
+        // Initialize shared memory
+        if (local_idx == 0) {
+            shared_min[point_group_idx].dist = INT_MAX;
+            shared_min[point_group_idx].cluster = -1;
+        }
+        __syncthreads();
+        
+        // Atomically update minimum distance for this point
+        atomicMin_double(&shared_min[point_group_idx].dist, distance);
+        __syncthreads();
+        
+        // If this thread found the minimum distance, record its cluster
+        if (distance == shared_min[point_group_idx].dist) {
+            shared_min[point_group_idx].cluster = cluster_idx;
+        }
+        __syncthreads();
+        
+        // Only one thread per point writes the final result
+        if (local_idx == 0) {
+            c[point_idx] = shared_min[point_group_idx].cluster;
+        }
+    }
 }
 
 __global__ void assignKernel(int *x, int *y, int *c, double *cx, double *cy, /* bool *changed, */ int k, int n) {
@@ -176,6 +283,8 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
     cudaEventCreate(&overall_stop);
     cudaEventRecord(overall_start, 0);
 
+    cudaSetDevice(0); // titan X
+
     int iter = 0;
     int * count = new int[k];
     double acc_red_time = 0.0f, acc_assign_time = 0.0f, acc_update_time = 0.0f, acc_centroid_time = 0.0f;
@@ -221,6 +330,14 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
     cudaMemcpy(d_cy, cy, k * sizeof(double), cudaMemcpyHostToDevice);
     printf("Begin\n");
 
+    #ifdef FLAT // WARNING: for large values of k assignKernel_flat returns wrong results due to contention over shared memory and other stuff... Don't use it!
+        if (k <= 1024){
+            printf("Flat\n");
+        } else { 
+            printf("Warning: cannot use FLAT with k > 1024, usign regular assign kernel instead\n");
+        }
+    #endif
+
     int blockSize = 256;
     int gridSize = (n + blockSize - 1) / blockSize;
     cudaMemset(d_c, -1, n * sizeof(int)); 
@@ -236,7 +353,20 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
         cudaMemset(d_count, 0, k * sizeof(int));
 
         cudaEventRecord(start, 0);
-        assignKernel<<<gridSize, blockSize>>>(d_x, d_y, d_c, d_cx, d_cy, /*d_changed,*/ k, n);
+
+        #ifdef FLAT // WARNING: for large values of k assignKernel_flat returns wrong results due to contention over shared memory and other stuff... Don't use it!
+            if (k <= 1024){
+                blockSize = k;
+                // size_t sharedMemSize = blockSize * (sizeof(double) + sizeof(int));
+                // assignKernel_flat_old<<<((n*k)+blockSize - 1)/blockSize, blockSize, sharedMemSize>>>(d_x, d_y, d_c, d_cx, d_cy, /*d_changed,*/ k, n);
+                assignKernel_flat<<<((n*k)+blockSize - 1)/blockSize, blockSize>>>(d_x, d_y, d_c, d_cx, d_cy, /*d_changed,*/ k, n);
+            } else {
+                assignKernel<<<gridSize, blockSize>>>(d_x, d_y, d_c, d_cx, d_cy, /*d_changed,*/ k, n);
+            }
+        #else
+            assignKernel<<<gridSize, blockSize>>>(d_x, d_y, d_c, d_cx, d_cy, /*d_changed,*/ k, n);
+        #endif
+
         cudaDeviceSynchronize();
         cudaEventRecord(stop, 0);
         cudaEventSynchronize(stop);
@@ -261,7 +391,7 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
         cudaEventElapsedTime(&timer_centroid, start, stop);
         acc_centroid_time += timer_centroid;
 
-        #ifdef HOSTREDUCE
+        #ifdef HOSTREDUCE // WARNING: for large values of k HOSTREDUCE causes significant performance penalties... Don't use it! I left this here to obtain results to discuss in the report. 
             timer_begin = omp_get_wtime();
             cudaMemcpy(cx, d_cx, k * sizeof(double), cudaMemcpyDeviceToHost);
             cudaMemcpy(cy, d_cy, k * sizeof(double), cudaMemcpyDeviceToHost);
@@ -327,10 +457,10 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
     }
 
     #ifdef HOSTREDUCE
-        printf("HOST Acc Reduction: %f\n", acc_red_time);
-        printf("Acc Data Transfer: %f\n", acc_data_transfer_time);
+        printf("HOST Acc Reduction: %f seconds\n", acc_red_time/1000);
+        printf("Acc Data Transfer: %f seconds\n", acc_data_transfer_time/1000);
     #else
-        printf("Acc Reduction: %f\n", acc_red_time);
+        printf("Acc Assign: %f seconds\n", acc_assign_time/1000);
     #endif
 
 
@@ -357,8 +487,434 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
     cudaEventSynchronize(overall_stop);
     float timer_overall;
     cudaEventElapsedTime(&timer_overall, overall_start, overall_stop);
-    printf("Kmeans total runtime: %f\n", timer_overall);
+    printf("Kmeans total runtime: %f seconds (Cuda events)\n", timer_overall/1000);
 }
+
+void kmeans_multigpu(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
+    int gpu_ids[2] = {0, 1}; // weirdly titan x gpus are listed as indices 1 and 3 in nvidia-smi but are actually indices 0 and 1
+
+    int gpu_count;
+    cudaGetDeviceCount(&gpu_count);
+    if (gpu_ids[0] >= gpu_count || gpu_ids[1] >= gpu_count) {
+        printf("Requested GPUs not available\n");
+        return;
+    }
+
+    cudaDeviceProp prop1, prop3;
+    cudaGetDeviceProperties(&prop1, gpu_ids[0]);
+    cudaGetDeviceProperties(&prop3, gpu_ids[1]);
+    printf("Using GPUs: %d (%s) and %d (%s)\n", 
+           gpu_ids[0], prop1.name, 
+           gpu_ids[1], prop3.name);
+
+    cudaEvent_t start[2], stop[2], overall_start, overall_stop;
+    cudaStream_t streams[2];
+    
+    for (int gpu = 0; gpu < 2; gpu++) {
+        cudaSetDevice(gpu_ids[gpu]);
+        cudaEventCreate(&start[gpu]);
+        cudaEventCreate(&stop[gpu]);
+        cudaStreamCreate(&streams[gpu]);
+    }
+    cudaEventCreate(&overall_start);
+    cudaEventCreate(&overall_stop);
+    cudaEventRecord(overall_start, 0);
+
+    int iter = 0;
+    int * count = new int[k];
+    // double acc_red_time = 0.0f, acc_assign_time = 0.0f, acc_update_time = 0.0f, acc_centroid_time = 0.0f;
+    double acc_assign_time[2] = {0.0f, 0.0f};
+
+    int n_per_gpu = n / 2;
+    int remainder = n % 2;
+    int n_gpu0 = n_per_gpu + remainder;
+    int n_gpu1 = n_per_gpu;
+
+    int *d_x[2], *d_y[2], *d_c[2];
+    double *d_cx[2], *d_cy[2], *d_sumx[2], *d_sumy[2];
+    int *d_count[2];
+    bool cont = false;
+
+    for (int gpu = 0; gpu < 2; gpu++) {
+        cudaSetDevice(gpu_ids[gpu]);
+        int current_n = (gpu == 0) ? n_gpu0 : n_gpu1;
+        
+        cudaMalloc(&d_x[gpu], current_n * sizeof(int));
+        cudaMalloc(&d_y[gpu], current_n * sizeof(int));
+        cudaMalloc(&d_c[gpu], current_n * sizeof(int));
+        cudaMalloc(&d_cx[gpu], k * sizeof(double));
+        cudaMalloc(&d_cy[gpu], k * sizeof(double));
+        cudaMalloc(&d_sumx[gpu], k * sizeof(double));
+        cudaMalloc(&d_sumy[gpu], k * sizeof(double));
+        cudaMalloc(&d_count[gpu], k * sizeof(int));
+    }
+
+    cudaSetDevice(gpu_ids[0]);
+    cudaMemcpy(d_x[0], x, n_gpu0 * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_y[0], y, n_gpu0 * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_cx[0], cx, k * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_cy[0], cy, k * sizeof(double), cudaMemcpyHostToDevice);
+
+    cudaSetDevice(gpu_ids[1]);
+    cudaMemcpy(d_x[1], x + n_gpu0, n_gpu1 * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_y[1], y + n_gpu0, n_gpu1 * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_cx[1], cx, k * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_cy[1], cy, k * sizeof(double), cudaMemcpyHostToDevice);
+
+    printf("Begin\n");
+
+    int blockSize = 256;
+    int gridSize[2];
+    gridSize[0] = (n_gpu0 + blockSize - 1) / blockSize;
+    gridSize[1] = (n_gpu1 + blockSize - 1) / blockSize;
+
+    for (int gpu = 0; gpu < 2; gpu++) {
+        cudaSetDevice(gpu_ids[gpu]);
+        cudaMemset(d_c[gpu], -1, (gpu == 0 ? n_gpu0 : n_gpu1) * sizeof(int));
+    }
+
+    while (iter < MAX_ITER) {
+        cont = false;
+        
+        for (int gpu = 0; gpu < 2; gpu++) {
+            cudaSetDevice(gpu_ids[gpu]);
+            cudaMemset(d_sumx[gpu], 0, k * sizeof(double));
+            cudaMemset(d_sumy[gpu], 0, k * sizeof(double));
+            cudaMemset(d_count[gpu], 0, k * sizeof(int));
+        }
+
+        for (int gpu = 0; gpu < 2; gpu++) {
+            cudaSetDevice(gpu_ids[gpu]);
+            int current_n = (gpu == 0) ? n_gpu0 : n_gpu1;
+            
+            cudaEventRecord(start[gpu], streams[gpu]);
+            assignKernel<<<gridSize[gpu], blockSize, 0, streams[gpu]>>>(
+                d_x[gpu], d_y[gpu], d_c[gpu], d_cx[gpu], d_cy[gpu], k, current_n
+            );
+            cudaDeviceSynchronize();
+            cudaEventRecord(stop[gpu], streams[gpu]);
+            cudaEventSynchronize(stop[gpu]);
+            float timer_assign = 0.0f;
+            cudaEventElapsedTime(&timer_assign, start[gpu], stop[gpu]);
+            acc_assign_time[gpu] += timer_assign;
+            
+            updateKernel<<<gridSize[gpu], blockSize, 0, streams[gpu]>>>(
+                d_x[gpu], d_y[gpu], d_c[gpu], k, current_n, d_sumx[gpu], d_sumy[gpu], d_count[gpu]
+            );
+        }
+
+        for (int gpu = 0; gpu < 2; gpu++) {
+            cudaSetDevice(gpu_ids[gpu]);
+            cudaDeviceSynchronize();
+        }
+
+        cudaSetDevice(gpu_ids[0]);
+        double *h_sumx = new double[k];
+        double *h_sumy = new double[k];
+        int *h_count = new int[k];
+
+        cudaMemcpy(h_sumx, d_sumx[0], k * sizeof(double), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_sumy, d_sumy[0], k * sizeof(double), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_count, d_count[0], k * sizeof(int), cudaMemcpyDeviceToHost);
+
+        double *h_sumx1 = new double[k];
+        double *h_sumy1 = new double[k];
+        int *h_count1 = new int[k];
+
+        cudaSetDevice(gpu_ids[1]);
+        cudaMemcpy(h_sumx1, d_sumx[1], k * sizeof(double), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_sumy1, d_sumy[1], k * sizeof(double), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_count1, d_count[1], k * sizeof(int), cudaMemcpyDeviceToHost);
+
+        for (int i = 0; i < k; i++) {
+            h_sumx[i] += h_sumx1[i];
+            h_sumy[i] += h_sumy1[i];
+            h_count[i] += h_count1[i];
+        }
+
+        for (int gpu = 0; gpu < 2; gpu++) {
+            cudaSetDevice(gpu_ids[gpu]);
+            cudaMemcpy(d_sumx[gpu], h_sumx, k * sizeof(double), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_sumy[gpu], h_sumy, k * sizeof(double), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_count[gpu], h_count, k * sizeof(int), cudaMemcpyHostToDevice);
+
+            // Compute new centroids
+            computeCentroids<<<(k + blockSize - 1) / blockSize, blockSize, 0, streams[gpu]>>>(
+                k, d_sumx[gpu], d_sumy[gpu], d_count[gpu], d_cx[gpu], d_cy[gpu]
+            );
+        }
+
+        // Check convergence
+        double *prev_cx = new double[k];
+        double *prev_cy = new double[k];
+        memcpy(prev_cx, cx, k * sizeof(double));
+        memcpy(prev_cy, cy, k * sizeof(double));
+
+        cudaSetDevice(gpu_ids[0]);
+        cudaMemcpy(cx, d_cx[0], k * sizeof(double), cudaMemcpyDeviceToHost);
+        cudaMemcpy(cy, d_cy[0], k * sizeof(double), cudaMemcpyDeviceToHost);
+
+        for (int i = 0; i < k; i++) {
+            cont |= ((cx[i] != prev_cx[i]) || (cy[i] != prev_cy[i]));
+        }
+
+        // Clean up temporary arrays
+        delete[] h_sumx;
+        delete[] h_sumy;
+        delete[] h_count;
+        delete[] h_sumx1;
+        delete[] h_sumy1;
+        delete[] h_count1;
+        delete[] prev_cx;
+        delete[] prev_cy;
+
+        if (!cont) {
+            // Copy final results back to host
+            cudaSetDevice(gpu_ids[0]);
+            cudaMemcpy(c, d_c[0], n_gpu0 * sizeof(int), cudaMemcpyDeviceToHost);
+            cudaSetDevice(gpu_ids[1]);
+            cudaMemcpy(c + n_gpu0, d_c[1], n_gpu1 * sizeof(int), cudaMemcpyDeviceToHost);
+            
+            printf("Converged at iteration %d\n", iter);
+            writeClusterAssignments(x, y, c, n, OUTFILE);
+            break;
+        }
+
+        iter++;
+    }
+
+    // Clean up
+    for (int gpu = 0; gpu < 2; gpu++) {
+        cudaSetDevice(gpu_ids[gpu]);
+        cudaFree(d_x[gpu]);
+        cudaFree(d_y[gpu]);
+        cudaFree(d_c[gpu]);
+        cudaFree(d_cx[gpu]);
+        cudaFree(d_cy[gpu]);
+        cudaFree(d_sumx[gpu]);
+        cudaFree(d_sumy[gpu]);
+        cudaFree(d_count[gpu]);
+        cudaEventDestroy(start[gpu]);
+        cudaEventDestroy(stop[gpu]);
+        cudaStreamDestroy(streams[gpu]);
+    }
+
+    cudaEventRecord(overall_stop, 0);
+    cudaEventSynchronize(overall_stop);
+    float timer_overall;
+    cudaEventElapsedTime(&timer_overall, overall_start, overall_stop);
+    printf("Accumulated assign kernel runtime gpu 1: %f seconds\n", acc_assign_time[0]/1000);
+    printf("Accumulated assign kernel runtime gpu 2: %f seconds\n", acc_assign_time[1]/1000);
+    printf("Kmeans total runtime (Cuda events): %f seconds\n", timer_overall/1000);
+}
+
+// void kmeans_multigpu_old(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
+//     cudaEvent_t start[2], stop[2], overall_start, overall_stop;
+//     cudaStream_t streams[2];
+//     // const int gpu_indices = {1,3}; // two titanx gpus
+    
+//     // Create events and streams for both GPUs
+//     for (int gpu = 0; gpu < 2; gpu++) {
+//         cudaSetDevice(gpu);
+//         cudaEventCreate(&start[gpu]);
+//         cudaEventCreate(&stop[gpu]);
+//         cudaStreamCreate(&streams[gpu]);
+//     }
+//     cudaEventCreate(&overall_start);
+//     cudaEventCreate(&overall_stop);
+//     cudaEventRecord(overall_start, 0);
+
+//     int iter = 0;
+//     int * count = new int[k];
+//     // double acc_red_time = 0.0f, acc_assign_time = 0.0f, acc_update_time = 0.0f, acc_centroid_time = 0.0f;
+//     // double acc_assign_time[2] = {0.0f, 0.0f};
+
+//     // Split data between GPUs
+//     int n_per_gpu = n / 2;
+//     int remainder = n % 2;
+//     int n_gpu0 = n_per_gpu + remainder;
+//     int n_gpu1 = n_per_gpu;
+
+//     // Arrays for each GPU
+//     int *d_x[2], *d_y[2], *d_c[2];
+//     double *d_cx[2], *d_cy[2], *d_sumx[2], *d_sumy[2];
+//     int *d_count[2];
+//     bool cont = false;
+
+//     // Allocate memory on both GPUs
+//     for (int gpu = 0; gpu < 2; gpu++) {
+//         cudaSetDevice(gpu);
+//         int current_n = (gpu == 0) ? n_gpu0 : n_gpu1;
+        
+//         cudaMalloc(&d_x[gpu], current_n * sizeof(int));
+//         cudaMalloc(&d_y[gpu], current_n * sizeof(int));
+//         cudaMalloc(&d_c[gpu], current_n * sizeof(int));
+//         cudaMalloc(&d_cx[gpu], k * sizeof(double));
+//         cudaMalloc(&d_cy[gpu], k * sizeof(double));
+//         cudaMalloc(&d_sumx[gpu], k * sizeof(double));
+//         cudaMalloc(&d_sumy[gpu], k * sizeof(double));
+//         cudaMalloc(&d_count[gpu], k * sizeof(int));
+//     }
+
+//     // Copy data to GPUs
+//     cudaSetDevice(0);
+//     cudaMemcpy(d_x[0], x, n_gpu0 * sizeof(int), cudaMemcpyHostToDevice);
+//     cudaMemcpy(d_y[0], y, n_gpu0 * sizeof(int), cudaMemcpyHostToDevice);
+//     cudaMemcpy(d_cx[0], cx, k * sizeof(double), cudaMemcpyHostToDevice);
+//     cudaMemcpy(d_cy[0], cy, k * sizeof(double), cudaMemcpyHostToDevice);
+
+//     cudaSetDevice(1);
+//     cudaMemcpy(d_x[1], x + n_gpu0, n_gpu1 * sizeof(int), cudaMemcpyHostToDevice);
+//     cudaMemcpy(d_y[1], y + n_gpu0, n_gpu1 * sizeof(int), cudaMemcpyHostToDevice);
+//     cudaMemcpy(d_cx[1], cx, k * sizeof(double), cudaMemcpyHostToDevice);
+//     cudaMemcpy(d_cy[1], cy, k * sizeof(double), cudaMemcpyHostToDevice);
+
+//     printf("Begin\n");
+
+//     int blockSize = 256;
+//     int gridSize[2];
+//     gridSize[0] = (n_gpu0 + blockSize - 1) / blockSize;
+//     gridSize[1] = (n_gpu1 + blockSize - 1) / blockSize;
+
+//     // Initialize cluster assignments
+//     for (int gpu = 0; gpu < 2; gpu++) {
+//         cudaSetDevice(gpu);
+//         cudaMemset(d_c[gpu], -1, (gpu == 0 ? n_gpu0 : n_gpu1) * sizeof(int));
+//     }
+
+//     while (iter < MAX_ITER) {
+//         cont = false;
+        
+//         // Reset counters on both GPUs
+//         for (int gpu = 0; gpu < 2; gpu++) {
+//             cudaSetDevice(gpu);
+//             cudaMemset(d_sumx[gpu], 0, k * sizeof(double));
+//             cudaMemset(d_sumy[gpu], 0, k * sizeof(double));
+//             cudaMemset(d_count[gpu], 0, k * sizeof(int));
+//         }
+
+//         // Run kernels on both GPUs
+//         for (int gpu = 0; gpu < 2; gpu++) {
+//             cudaSetDevice(gpu);
+//             int current_n = (gpu == 0) ? n_gpu0 : n_gpu1;
+            
+//             cudaEventRecord(start[gpu], streams[gpu]);
+//             assignKernel<<<gridSize[gpu], blockSize, 0, streams[gpu]>>>(
+//                 d_x[gpu], d_y[gpu], d_c[gpu], d_cx[gpu], d_cy[gpu], k, current_n
+//             );
+            
+//             updateKernel<<<gridSize[gpu], blockSize, 0, streams[gpu]>>>(
+//                 d_x[gpu], d_y[gpu], d_c[gpu], k, current_n, d_sumx[gpu], d_sumy[gpu], d_count[gpu]
+//             );
+//         }
+
+//         // Synchronize both GPUs
+//         for (int gpu = 0; gpu < 2; gpu++) {
+//             cudaSetDevice(gpu);
+//             cudaDeviceSynchronize();
+//         }
+
+//         // Combine results from both GPUs on GPU 0
+//         cudaSetDevice(0);
+//         double *h_sumx = new double[k];
+//         double *h_sumy = new double[k];
+//         int *h_count = new int[k];
+
+//         // Copy results from both GPUs to host
+//         cudaMemcpy(h_sumx, d_sumx[0], k * sizeof(double), cudaMemcpyDeviceToHost);
+//         cudaMemcpy(h_sumy, d_sumy[0], k * sizeof(double), cudaMemcpyDeviceToHost);
+//         cudaMemcpy(h_count, d_count[0], k * sizeof(int), cudaMemcpyDeviceToHost);
+
+//         double *h_sumx1 = new double[k];
+//         double *h_sumy1 = new double[k];
+//         int *h_count1 = new int[k];
+
+//         cudaSetDevice(1);
+//         cudaMemcpy(h_sumx1, d_sumx[1], k * sizeof(double), cudaMemcpyDeviceToHost);
+//         cudaMemcpy(h_sumy1, d_sumy[1], k * sizeof(double), cudaMemcpyDeviceToHost);
+//         cudaMemcpy(h_count1, d_count[1], k * sizeof(int), cudaMemcpyDeviceToHost);
+
+//         // Combine results
+//         for (int i = 0; i < k; i++) {
+//             h_sumx[i] += h_sumx1[i];
+//             h_sumy[i] += h_sumy1[i];
+//             h_count[i] += h_count1[i];
+//         }
+
+//         // Copy combined results back to both GPUs
+//         for (int gpu = 0; gpu < 2; gpu++) {
+//             cudaSetDevice(gpu);
+//             cudaMemcpy(d_sumx[gpu], h_sumx, k * sizeof(double), cudaMemcpyHostToDevice);
+//             cudaMemcpy(d_sumy[gpu], h_sumy, k * sizeof(double), cudaMemcpyHostToDevice);
+//             cudaMemcpy(d_count[gpu], h_count, k * sizeof(int), cudaMemcpyHostToDevice);
+
+//             // Compute new centroids
+//             computeCentroids<<<(k + blockSize - 1) / blockSize, blockSize, 0, streams[gpu]>>>(
+//                 k, d_sumx[gpu], d_sumy[gpu], d_count[gpu], d_cx[gpu], d_cy[gpu]
+//             );
+//         }
+
+//         // Check convergence
+//         double *prev_cx = new double[k];
+//         double *prev_cy = new double[k];
+//         memcpy(prev_cx, cx, k * sizeof(double));
+//         memcpy(prev_cy, cy, k * sizeof(double));
+
+//         cudaSetDevice(0);
+//         cudaMemcpy(cx, d_cx[0], k * sizeof(double), cudaMemcpyDeviceToHost);
+//         cudaMemcpy(cy, d_cy[0], k * sizeof(double), cudaMemcpyDeviceToHost);
+
+//         for (int i = 0; i < k; i++) {
+//             cont |= ((cx[i] != prev_cx[i]) || (cy[i] != prev_cy[i]));
+//         }
+
+//         // Clean up temporary arrays
+//         delete[] h_sumx;
+//         delete[] h_sumy;
+//         delete[] h_count;
+//         delete[] h_sumx1;
+//         delete[] h_sumy1;
+//         delete[] h_count1;
+//         delete[] prev_cx;
+//         delete[] prev_cy;
+
+//         if (!cont) {
+//             // Copy final results back to host
+//             cudaSetDevice(0);
+//             cudaMemcpy(c, d_c[0], n_gpu0 * sizeof(int), cudaMemcpyDeviceToHost);
+//             cudaSetDevice(1);
+//             cudaMemcpy(c + n_gpu0, d_c[1], n_gpu1 * sizeof(int), cudaMemcpyDeviceToHost);
+            
+//             printf("Converged at iteration %d\n", iter);
+//             writeClusterAssignments(x, y, c, n, OUTFILE);
+//             break;
+//         }
+
+//         iter++;
+//     }
+
+//     // Clean up
+//     for (int gpu = 0; gpu < 2; gpu++) {
+//         cudaSetDevice(gpu);
+//         cudaFree(d_x[gpu]);
+//         cudaFree(d_y[gpu]);
+//         cudaFree(d_c[gpu]);
+//         cudaFree(d_cx[gpu]);
+//         cudaFree(d_cy[gpu]);
+//         cudaFree(d_sumx[gpu]);
+//         cudaFree(d_sumy[gpu]);
+//         cudaFree(d_count[gpu]);
+//         cudaEventDestroy(start[gpu]);
+//         cudaEventDestroy(stop[gpu]);
+//         cudaStreamDestroy(streams[gpu]);
+//     }
+
+//     cudaEventRecord(overall_stop, 0);
+//     cudaEventSynchronize(overall_stop);
+//     float timer_overall;
+//     cudaEventElapsedTime(&timer_overall, overall_start, overall_stop);
+//     printf("Kmeans total runtime: %f seconds (Cuda events)\n", timer_overall/1000);
+// }
 
 int readfile(const string& fname, int*& x, int*& y) {
     ifstream f;
@@ -424,10 +980,15 @@ int main(int argc, char *argv[]) {
 
     // Measure k-means execution time
     double kmeans_start = omp_get_wtime();
-    kmeans(x, y, c, cx, cy, k, n);
+    #ifndef MULTIGPU
+        kmeans(x, y, c, cx, cy, k, n);
+    #else
+        printf("Multi GPU\n");
+        kmeans_multigpu(x, y, c, cx, cy, k, n);
+    #endif
 
     double kmeans_end = omp_get_wtime();
-    printf("K-Means Execution Time: %f seconds\n", kmeans_end - kmeans_start);
+    printf("K-Means Execution Time (OMP wtime): %f seconds \n", kmeans_end - kmeans_start);
 
     #ifdef DEBUG
         for (int i = 0; i < k; i++){
