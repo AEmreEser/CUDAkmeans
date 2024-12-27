@@ -20,8 +20,8 @@ using namespace std;
             FLAT produces wrong results for k > 1024 --> the program will automatically use regular assign kernel instead of FLAT if FLAT is specified for k > 1024
  */
 
-#ifndef MAX_ITER
-#define MAX_ITER 500
+#ifndef MAXITER
+#define MAXITER 500
 #endif
 
 #ifndef OUTFILE
@@ -107,41 +107,34 @@ __global__ void assignKernel_flat_old(int *x, int *y, int *c, double *cx, double
 
 __global__ void assignKernel_flat(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int point_idx = idx / k;  // Which point this thread is working on
-    int cluster_idx = idx % k;  // Which cluster this thread is evaluating
+    int point_idx = idx / k;  // point this thread is working on
+    int cluster_idx = idx % k;  // cluster this thread is working on
     
     if (point_idx < n) {
-        // Calculate distance for this point-cluster pair
         double distance = dist(cx[cluster_idx], cy[cluster_idx], x[point_idx], y[point_idx]);
         
-        // Use shared memory to track minimum distance for each point within a block
         __shared__ struct {
             double dist;
             int cluster;
         } shared_min[256];  // Assume block size <= 256
         
-        // Thread's position within its point group in the block
         int local_idx = threadIdx.x % k;
         int point_group_idx = threadIdx.x / k;
-        
-        // Initialize shared memory
+
         if (local_idx == 0) {
             shared_min[point_group_idx].dist = INT_MAX;
             shared_min[point_group_idx].cluster = -1;
         }
         __syncthreads();
         
-        // Atomically update minimum distance for this point
         atomicMin_double(&shared_min[point_group_idx].dist, distance);
         __syncthreads();
         
-        // If this thread found the minimum distance, record its cluster
         if (distance == shared_min[point_group_idx].dist) {
             shared_min[point_group_idx].cluster = cluster_idx;
         }
         __syncthreads();
         
-        // Only one thread per point writes the final result
         if (local_idx == 0) {
             c[point_idx] = shared_min[point_group_idx].cluster;
         }
@@ -342,7 +335,7 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
     int gridSize = (n + blockSize - 1) / blockSize;
     cudaMemset(d_c, -1, n * sizeof(int)); 
 
-    while (iter < MAX_ITER) {
+    while (iter < MAXITER) {
         #ifdef DEBUG
             printf("==========%d=========\n", iter);
         #endif
@@ -570,8 +563,13 @@ void kmeans_multigpu(int *x, int *y, int *c, double *cx, double *cy, int k, int 
         cudaSetDevice(gpu_ids[gpu]);
         cudaMemset(d_c[gpu], -1, (gpu == 0 ? n_gpu0 : n_gpu1) * sizeof(int));
     }
+    #ifdef FLAT
+    if (k > 1024){
+        printf("Cannot use flat assignment for k > 1024, using regular assignment instead\n");
+    }
+    #endif
 
-    while (iter < MAX_ITER) {
+    while (iter < MAXITER) {
         cont = false;
         
         for (int gpu = 0; gpu < 2; gpu++) {
@@ -581,14 +579,27 @@ void kmeans_multigpu(int *x, int *y, int *c, double *cx, double *cy, int k, int 
             cudaMemset(d_count[gpu], 0, k * sizeof(int));
         }
 
+        #ifdef FLAT
+            int assing_gridsize[2];
+            int assign_blockSize = k;
+            assing_gridsize[0] = ((n_gpu0 * k) + assign_blockSize - 1)/assign_blockSize;
+            assing_gridsize[1] = ((n_gpu1 * k) + assign_blockSize - 1)/assign_blockSize;
+        #endif
+
         for (int gpu = 0; gpu < 2; gpu++) {
             cudaSetDevice(gpu_ids[gpu]);
             int current_n = (gpu == 0) ? n_gpu0 : n_gpu1;
             
             cudaEventRecord(start[gpu], streams[gpu]);
-            assignKernel<<<gridSize[gpu], blockSize, 0, streams[gpu]>>>(
-                d_x[gpu], d_y[gpu], d_c[gpu], d_cx[gpu], d_cy[gpu], k, current_n
-            );
+            #ifdef FLAT
+            if (k > 1024){
+                assignKernel<<<gridSize[gpu], blockSize, 0, streams[gpu]>>>( d_x[gpu], d_y[gpu], d_c[gpu], d_cx[gpu], d_cy[gpu], k, current_n);
+            } else {
+                assignKernel_flat<<<assing_gridsize[gpu], assign_blockSize, 0, streams[gpu]>>>( d_x[gpu], d_y[gpu], d_c[gpu], d_cx[gpu], d_cy[gpu], k, current_n);
+            }
+            #else
+                assignKernel<<<gridSize[gpu], blockSize, 0, streams[gpu]>>>( d_x[gpu], d_y[gpu], d_c[gpu], d_cx[gpu], d_cy[gpu], k, current_n);
+            #endif
             cudaDeviceSynchronize();
             cudaEventRecord(stop[gpu], streams[gpu]);
             cudaEventSynchronize(stop[gpu]);
