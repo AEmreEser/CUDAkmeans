@@ -63,6 +63,11 @@ __device__ void atomicMin_double(double* address, double val) {
     } while (assumed != old);
 }
 
+struct shared_min_t {
+    double dist;
+    int cluster;
+};
+
 __global__ void assignKernel_flat(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int point_idx = idx / k;  // point this thread is working on
@@ -71,10 +76,7 @@ __global__ void assignKernel_flat(int *x, int *y, int *c, double *cx, double *cy
     if (point_idx < n) {
         double distance = dist(cx[cluster_idx], cy[cluster_idx], x[point_idx], y[point_idx]);
         
-        __shared__ struct {
-            double dist;
-            int cluster;
-        } shared_min[256];
+        extern __shared__ shared_min_t shared_min[];
         
         int local_idx = threadIdx.x % k;
         int point_group_idx = threadIdx.x / k;
@@ -244,27 +246,17 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
     double *d_cx, *d_cy, *d_sumx, *d_sumy; 
     int *d_count;
     bool cont;
-    #ifdef HOSTREDUCE
-        double *prev_cx, *prev_cy;
-        #ifdef PINMEM
-            cudaMallocHost(&prev_cx, k*sizeof(double));
-            cudaMallocHost(&prev_cy, k*sizeof(double));
-        #else
-            prev_cx = (double*)malloc(k*sizeof(double));
-            prev_cy = (double*)malloc(k*sizeof(double));
-        #endif
-    #else
-        double *d_prev_cx, *d_prev_cy;
-        bool *d_changed;
-        bool *d_red_change;
-        cudaMalloc(&d_red_change, 1 * sizeof(bool));
-        cudaMalloc(&d_prev_cx, k * sizeof(double));
-        cudaMalloc(&d_prev_cy, k * sizeof(double));
-        cudaMalloc(&d_changed, k * sizeof(bool));
+    
+    double *d_prev_cx, *d_prev_cy;
+    bool *d_changed;
+    bool *d_red_change;
+    cudaMalloc(&d_red_change, 1 * sizeof(bool));
+    cudaMalloc(&d_prev_cx, k * sizeof(double));
+    cudaMalloc(&d_prev_cy, k * sizeof(double));
+    cudaMalloc(&d_changed, k * sizeof(bool));
 
-        cudaMemset(d_changed, false, k*sizeof(bool));
-        cudaMemset(d_red_change,    false, 1*sizeof(bool));
-    #endif
+    cudaMemset(d_changed, false, k*sizeof(bool));
+    cudaMemset(d_red_change,    false, 1*sizeof(bool));
 
     cudaMalloc(&d_x, n * sizeof(int));
     cudaMalloc(&d_y, n * sizeof(int));
@@ -308,7 +300,7 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
         #ifdef FLAT // WARNING: for large values of k assignKernel_flat returns wrong results due to contention over shared memory and other stuff... Don't use it!
             if (k <= 1024){
                 blockSize = k;
-               assignKernel_flat<<<((n*k)+blockSize - 1)/blockSize, blockSize>>>(d_x, d_y, d_c, d_cx, d_cy, k, n);
+               assignKernel_flat<<<((n*k)+blockSize - 1)/blockSize, blockSize, k * sizeof(shared_min_t)>>>(d_x, d_y, d_c, d_cx, d_cy, k, n);
             } else {
                 assignKernel<<<gridSize, blockSize>>>(d_x, d_y, d_c, d_cx, d_cy, k, n);
             }
@@ -340,41 +332,15 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
         cudaEventElapsedTime(&timer_centroid, start, stop);
         acc_centroid_time += timer_centroid;
 
-        #ifdef HOSTREDUCE // WARNING: for large values of k HOSTREDUCE causes significant performance penalties... Don't use it! I left this here to obtain results to discuss in the report. 
-            timer_begin = omp_get_wtime();
-            cudaMemcpy(cx, d_cx, k * sizeof(double), cudaMemcpyDeviceToHost);
-            cudaMemcpy(cy, d_cy, k * sizeof(double), cudaMemcpyDeviceToHost);
-            cudaDeviceSynchronize(); // there is one sync in main already
-            timer_end = omp_get_wtime();
-            // printf("Data migration (device to host): %f\n", timer_end - timer_begin);
-            acc_data_transfer_time += timer_end - timer_begin;
-            // easiest way to do this is in here
-
-            timer_begin = omp_get_wtime();
-            #pragma omp parallel for reduction(|:cont)
-            for(int i = 0; i < k; i++){
-                cont |= ((cx[i] != prev_cx[i]) || (cy[i] != prev_cy[i]));
-            }
-
-            #pragma omp parallel for
-            for (int i = 0; i < k; i++){
-                prev_cx[i] = cx[i];
-                prev_cy[i] = cy[i];
-            }
-            timer_end = omp_get_wtime();
-            // printf("Host Reduction: %f\n", timer_end - timer_begin);
-            acc_red_time += timer_end - timer_begin;
-        #else
-            cudaEventRecord(start, 0);
-            checkClusterChange<<<k, 1>>>(d_cx, d_cy, d_prev_cx, d_prev_cy, d_changed, d_red_change, k);
-            cudaDeviceSynchronize();
-            cudaMemcpy(&cont, d_red_change, 1 *sizeof(bool), cudaMemcpyDeviceToHost);
-            cudaEventRecord(stop, 0);
-            cudaEventSynchronize(stop);
-            float timer_reduce;
-            cudaEventElapsedTime(&timer_reduce, start, stop);
-            acc_red_time += timer_reduce;
-        #endif
+        cudaEventRecord(start, 0);
+        checkClusterChange<<<k, 1>>>(d_cx, d_cy, d_prev_cx, d_prev_cy, d_changed, d_red_change, k);
+        cudaDeviceSynchronize();
+        cudaMemcpy(&cont, d_red_change, 1 *sizeof(bool), cudaMemcpyDeviceToHost);
+        cudaEventRecord(stop, 0);
+        cudaEventSynchronize(stop);
+        float timer_reduce;
+        cudaEventElapsedTime(&timer_reduce, start, stop);
+        acc_red_time += timer_reduce;
 
 
         #ifdef DEBUG
@@ -405,12 +371,7 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
         iter++;
     }
 
-    #ifdef HOSTREDUCE
-        printf("HOST Acc Reduction: %f seconds\n", acc_red_time/1000);
-        printf("Acc Data Transfer: %f seconds\n", acc_data_transfer_time/1000);
-    #else
         printf("Acc Assign: %f seconds\n", acc_assign_time/1000);
-    #endif
 
 
     cudaFree(d_x);
@@ -418,19 +379,11 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
     cudaFree(d_c);
     cudaFree(d_cx);
     cudaFree(d_cy);
+    cudaFree(d_prev_cx);
+    cudaFree(d_prev_cy);
     cudaFree(d_sumx);
     cudaFree(d_sumy);
     cudaFree(d_count);
-    #ifdef PINMEM
-        cudaFreeHost(prev_cx);
-        cudaFreeHost(prev_cy);
-    #endif
-    #ifndef HOSTREDUCE // NOT defined
-        cudaFree(d_changed);
-        cudaFree(d_prev_cx);
-        cudaFree(d_prev_cy);
-        cudaFree(d_red_change);
-    #endif
 
     cudaEventRecord(overall_stop, 0);
     cudaEventSynchronize(overall_stop);
@@ -553,7 +506,7 @@ void kmeans_multigpu(int *x, int *y, int *c, double *cx, double *cy, int k, int 
             if (k > 1024){
                 assignKernel<<<gridSize[gpu], blockSize, 0, streams[gpu]>>>( d_x[gpu], d_y[gpu], d_c[gpu], d_cx[gpu], d_cy[gpu], k, current_n);
             } else {
-                assignKernel_flat<<<assing_gridsize[gpu], assign_blockSize, 0, streams[gpu]>>>( d_x[gpu], d_y[gpu], d_c[gpu], d_cx[gpu], d_cy[gpu], k, current_n);
+                assignKernel_flat<<<assing_gridsize[gpu], assign_blockSize, k*sizeof(shared_min_t), streams[gpu]>>>( d_x[gpu], d_y[gpu], d_c[gpu], d_cx[gpu], d_cy[gpu], k, current_n);
             }
             #else
                 assignKernel<<<gridSize[gpu], blockSize, 0, streams[gpu]>>>( d_x[gpu], d_y[gpu], d_c[gpu], d_cx[gpu], d_cy[gpu], k, current_n);
