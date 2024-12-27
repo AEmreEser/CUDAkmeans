@@ -25,7 +25,7 @@ using namespace std;
 #endif
 
 #ifndef OUTFILE
-#define OUTFILE "out.txt"
+#define OUTFILE "out_cuda.txt"
 #endif
 
 #define CHECK_CUDA_ERROR() { \
@@ -768,7 +768,10 @@ int main(int argc, char *argv[]) {
     c = new int[n];
 
     // Initialize centroids
+    double init_begin = omp_get_wtime();
     randomCenters(x, y, n, k, cx, cy);
+    double init_end = omp_get_wtime();
+    printf("Random Centers Init Time (OMP wtime): %f seconds \n", init_end - init_begin);
 
     // Measure k-means execution time
     double kmeans_start = omp_get_wtime();
