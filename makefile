@@ -18,12 +18,6 @@ all: $(EXE)
 $(EXE): $(SRC)
 	$(NVCC) $(SRC) $(NVCCFLAGS) $(addflags) -Xcompiler "$(CXXFLAGS)" -o $(EXE) 
 
-# obsolete:
-# bsize: $(SRC)
-# 	make $(EXE) addflags="-DBLOCKSIZE=$(k)"
-
-# brun: clean bsize run
-
 debug: $(SRC)
 	$(NVCC) $(SRC) $(NVCCFLAGS) -DDEBUG -Xcompiler "$(CXXFLAGS)" -o $(EXE) 
 
