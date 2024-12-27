@@ -137,6 +137,13 @@ __global__ void check_cluster_change(double *cx, double *cy, double *prev_cx, do
         }
         __syncthreads();
     }
+    // Proved suboptimal
+    // for (int s = k/2; s>0; s>>=1){
+    //     if (threadId < s){
+    //         changed[threadId] |= changed[threadId + s];
+    //     }
+    //     __syncthreads();
+    // }
 
     prev_cx[threadId] = cx[threadId];
     prev_cy[threadId] = cy[threadId];
@@ -230,9 +237,16 @@ void writeClusterAssignments(const int* x, const int* y, const int* c, int n, co
 }
 
 void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
+    cudaEvent_t start, stop, overall_start, overall_stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventCreate(&overall_start);
+    cudaEventCreate(&overall_stop);
+    cudaEventRecord(overall_start, 0);
+
     int iter = 0;
     int * count = new int[k];
-    double acc_red_time = 0.0f, acc_data_transfer_time = 0.0f;
+    double acc_red_time = 0.0f, acc_assign_time = 0.0f, acc_update_time = 0.0f, acc_centroid_time = 0.0f;
 
     int *d_x, *d_y, *d_c;
     double *d_cx, *d_cy, *d_sumx, *d_sumy; 
@@ -301,26 +315,32 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
         cudaMemset(d_sumy, 0, k * sizeof(double));
         cudaMemset(d_count, 0, k * sizeof(int));
 
-        double timer_begin = omp_get_wtime();
+        cudaEventRecord(start, 0);
         assignKernel<<<gridSize, blockSize>>>(d_x, d_y, d_c, d_cx, d_cy, /*d_changed,*/ k, n);
         // assignKernelFullyParallel<<< (n*k + k - 1)/k, k >>>(d_x, d_y, d_c, d_cx, d_cy, d_all_dists, d_all_assignments, /*d_changed,*/ k, n);
         cudaDeviceSynchronize();
-        double timer_end = omp_get_wtime();
-        // printf("Assign Kernel: %f\n", timer_end - timer_begin);
+        cudaEventRecord(stop, 0);
+        cudaEventSynchronize(stop);
+        float timer_assign;
+        cudaEventElapsedTime(&timer_assign, start, stop);
+        acc_assign_time += timer_assign;
         
-        timer_begin = omp_get_wtime();
+        cudaEventRecord(start, 0);
         updateKernel<<<gridSize, blockSize>>>(d_x, d_y, d_c, k, n, d_sumx, d_sumy, /* d_changed, d_cont,*/ d_count);
         cudaDeviceSynchronize(); // wait for gpu
-        timer_end = omp_get_wtime();
-        // printf("Update Kernel: %f\n", timer_end - timer_begin);
-        // cudaMemcpy(cont, d_cont, 1 * sizeof(bool), cudaMemcpyDeviceToHost);
+        cudaEventRecord(stop, 0);
+        cudaEventSynchronize(stop);
+        float timer_update;
+        cudaEventElapsedTime(&timer_update, start, stop);
+        acc_update_time += timer_update;
         
-        timer_begin = omp_get_wtime();
+        cudaEventRecord(start, 0);
         computeCentroids<<<(k + blockSize - 1) / blockSize, blockSize>>>(k, d_sumx, d_sumy, d_count, d_cx, d_cy);
-        timer_end = omp_get_wtime();
-        // printf("Centroid Kernel: %f\n", timer_end - timer_begin);
-        // cudaDeviceSynchronize();
-
+        cudaEventRecord(stop, 0);
+        cudaEventSynchronize(stop);
+        float timer_centroid;
+        cudaEventElapsedTime(&timer_centroid, start, stop);
+        acc_centroid_time += timer_centroid;
 
         #ifdef HOSTREDUCE
             timer_begin = omp_get_wtime();
@@ -347,14 +367,15 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
             // printf("Host Reduction: %f\n", timer_end - timer_begin);
             acc_red_time += timer_end - timer_begin;
         #else
-            timer_begin = omp_get_wtime();
+            cudaEventRecord(start, 0);
             check_cluster_change<<<k, 1>>>(d_cx, d_cy, d_prev_cx, d_prev_cy, d_changed, d_red_change, k);
             cudaDeviceSynchronize();
             cudaMemcpy(&cont, d_red_change, 1 *sizeof(bool), cudaMemcpyDeviceToHost);
-            cudaDeviceSynchronize();
-            // cout << "From host, cont=" << cont << endl;
-            timer_end = omp_get_wtime();
-            acc_red_time += timer_end - timer_begin;
+            cudaEventRecord(stop, 0);
+            cudaEventSynchronize(stop);
+            float timer_reduce;
+            cudaEventElapsedTime(&timer_reduce, start, stop);
+            acc_red_time += timer_reduce;
         #endif
 
 
@@ -413,6 +434,11 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
         cudaFree(d_red_change);
     #endif
 
+    cudaEventRecord(overall_stop, 0);
+    cudaEventSynchronize(overall_stop);
+    float timer_overall;
+    cudaEventElapsedTime(&timer_overall, overall_start, overall_stop);
+    printf("Kmeans total runtime: %f\n", timer_overall);
 }
 
 int readfile(const string& fname, int*& x, int*& y) {
