@@ -63,48 +63,6 @@ __device__ void atomicMin_double(double* address, double val) {
     } while (assumed != old);
 }
 
-__global__ void assignKernel_flat_old(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int point_idx = idx / k;  // Which point this thread is working on
-    int cluster_idx = idx % k;  // Which cluster this thread is evaluating
-    
-    if (point_idx < n) {
-        // Each thread computes distance for its point-cluster pair
-        double distance = dist(cx[cluster_idx], cy[cluster_idx], x[point_idx], y[point_idx]);
-        
-        // Shared memory to store distances and corresponding clusters
-        extern __shared__ double shared_data[];
-        double* shared_distances = shared_data;
-        int* shared_clusters = (int*)&shared_data[blockDim.x];
-        
-        // Store this thread's results in shared memory
-        shared_distances[threadIdx.x] = distance;
-        shared_clusters[threadIdx.x] = cluster_idx;
-        __syncthreads();
-        
-        // First thread for each point finds the minimum among all clusters
-        if (cluster_idx == 0) {
-            double min_dist = distance;
-            int best_cluster = cluster_idx;
-            
-            // Find minimum distance among all clusters for this point
-            int point_start = (threadIdx.x / k) * k;  // Start index for this point's clusters
-            for (int j = 1; j < k; j++) {
-                int idx_in_block = point_start + j;
-                if (idx_in_block < blockDim.x) {
-                    if (shared_distances[idx_in_block] < min_dist) {
-                        min_dist = shared_distances[idx_in_block];
-                        best_cluster = shared_clusters[idx_in_block];
-                    }
-                }
-            }
-            
-            // Write final result for this point
-            c[point_idx] = best_cluster;
-        }
-    }
-}
-
 __global__ void assignKernel_flat(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int point_idx = idx / k;  // point this thread is working on
@@ -116,7 +74,7 @@ __global__ void assignKernel_flat(int *x, int *y, int *c, double *cx, double *cy
         __shared__ struct {
             double dist;
             int cluster;
-        } shared_min[256];  // Assume block size <= 256
+        } shared_min[256];
         
         int local_idx = threadIdx.x % k;
         int point_group_idx = threadIdx.x / k;
