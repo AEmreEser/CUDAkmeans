@@ -357,14 +357,12 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
         #ifdef FLAT // WARNING: for large values of k assignKernel_flat returns wrong results due to contention over shared memory and other stuff... Don't use it!
             if (k <= 1024){
                 blockSize = k;
-                // size_t sharedMemSize = blockSize * (sizeof(double) + sizeof(int));
-                // assignKernel_flat_old<<<((n*k)+blockSize - 1)/blockSize, blockSize, sharedMemSize>>>(d_x, d_y, d_c, d_cx, d_cy, /*d_changed,*/ k, n);
-                assignKernel_flat<<<((n*k)+blockSize - 1)/blockSize, blockSize>>>(d_x, d_y, d_c, d_cx, d_cy, /*d_changed,*/ k, n);
+               assignKernel_flat<<<((n*k)+blockSize - 1)/blockSize, blockSize>>>(d_x, d_y, d_c, d_cx, d_cy, k, n);
             } else {
-                assignKernel<<<gridSize, blockSize>>>(d_x, d_y, d_c, d_cx, d_cy, /*d_changed,*/ k, n);
+                assignKernel<<<gridSize, blockSize>>>(d_x, d_y, d_c, d_cx, d_cy, k, n);
             }
         #else
-            assignKernel<<<gridSize, blockSize>>>(d_x, d_y, d_c, d_cx, d_cy, /*d_changed,*/ k, n);
+            assignKernel<<<gridSize, blockSize>>>(d_x, d_y, d_c, d_cx, d_cy, k, n);
         #endif
 
         cudaDeviceSynchronize();
@@ -375,7 +373,7 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
         acc_assign_time += timer_assign;
         
         cudaEventRecord(start, 0);
-        updateKernel<<<gridSize, blockSize>>>(d_x, d_y, d_c, k, n, d_sumx, d_sumy, /* d_changed, d_cont,*/ d_count);
+        updateKernel<<<gridSize, blockSize>>>(d_x, d_y, d_c, k, n, d_sumx, d_sumy, d_count);
         cudaDeviceSynchronize(); // wait for gpu
         cudaEventRecord(stop, 0);
         cudaEventSynchronize(stop);
