@@ -50,7 +50,6 @@ __host__ __device__ double dist(double x1, double y1, double x2, double y2) {
     return (x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2);  // sqrt is omitted as it reduces performance.
 }
 
-// Helper function for atomic minimum operation on doubles
 __device__ void atomicMin_double(double* address, double val) {
     unsigned long long* address_as_ull = (unsigned long long*)address;
     unsigned long long old = *address_as_ull;
@@ -149,7 +148,6 @@ __global__ void checkClusterChange(double *cx, double *cy, double *prev_cx, doub
     prev_cx[threadId] = cx[threadId];
     prev_cy[threadId] = cy[threadId];
 
-    // The first thread in each block writes the result to global memory
     if (threadId == 0) {
         *red_change |= changed[0];
     }
@@ -382,6 +380,8 @@ void kmeans(int *x, int *y, int *c, double *cx, double *cy, int k, int n) {
     cudaFree(d_prev_cx);
     cudaFree(d_prev_cy);
     cudaFree(d_sumx);
+    cudaFree(d_changed);
+    cudaFree(d_red_change);
     cudaFree(d_sumy);
     cudaFree(d_count);
 
@@ -558,13 +558,11 @@ void kmeans_multigpu(int *x, int *y, int *c, double *cx, double *cy, int k, int 
             cudaMemcpy(d_sumy[gpu], h_sumy, k * sizeof(double), cudaMemcpyHostToDevice);
             cudaMemcpy(d_count[gpu], h_count, k * sizeof(int), cudaMemcpyHostToDevice);
 
-            // Compute new centroids
             computeCentroids<<<(k + blockSize - 1) / blockSize, blockSize, 0, streams[gpu]>>>(
                 k, d_sumx[gpu], d_sumy[gpu], d_count[gpu], d_cx[gpu], d_cy[gpu]
             );
         }
 
-        // Check convergence
         double *prev_cx = new double[k];
         double *prev_cy = new double[k];
         memcpy(prev_cx, cx, k * sizeof(double));
@@ -578,7 +576,6 @@ void kmeans_multigpu(int *x, int *y, int *c, double *cx, double *cy, int k, int 
             cont |= ((cx[i] != prev_cx[i]) || (cy[i] != prev_cy[i]));
         }
 
-        // Clean up temporary arrays
         delete[] h_sumx;
         delete[] h_sumy;
         delete[] h_count;
@@ -589,7 +586,6 @@ void kmeans_multigpu(int *x, int *y, int *c, double *cx, double *cy, int k, int 
         delete[] prev_cy;
 
         if (!cont) {
-            // Copy final results back to host
             cudaSetDevice(gpu_ids[0]);
             cudaMemcpy(c, d_c[0], n_gpu0 * sizeof(int), cudaMemcpyDeviceToHost);
             cudaSetDevice(gpu_ids[1]);
@@ -603,7 +599,6 @@ void kmeans_multigpu(int *x, int *y, int *c, double *cx, double *cy, int k, int 
         iter++;
     }
 
-    // Clean up
     for (int gpu = 0; gpu < 2; gpu++) {
         cudaSetDevice(gpu_ids[gpu]);
         cudaFree(d_x[gpu]);
@@ -665,7 +660,6 @@ int readfile(const string& fname, int*& x, int*& y) {
 
 
 int main(int argc, char *argv[]) {
-    // Check arguments
     if (argc - 1 != 2) {
         printf("./kmeans <filename> <k>\n");
         exit(-1);
@@ -680,20 +674,17 @@ int main(int argc, char *argv[]) {
     int *x, *y, *c;
     double *cx, *cy;
 
-    // Read input data
     int n = readfile(fname, x, y);
     
     cx = new double[k];
     cy = new double[k];
     c = new int[n];
 
-    // Initialize centroids
     double init_begin = omp_get_wtime();
     randomCenters(x, y, n, k, cx, cy);
     double init_end = omp_get_wtime();
     printf("Random Centers Init Time (OMP wtime): %f seconds \n", init_end - init_begin);
 
-    // Measure k-means execution time
     double kmeans_start = omp_get_wtime();
     #ifndef MULTIGPU
         kmeans(x, y, c, cx, cy, k, n);
